@@ -1,0 +1,55 @@
+services:
+  finance-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: finance-bot
+    restart: always
+
+    environment:
+      # Telegram Bot Configuration
+      - BOT_TOKEN=${BOT_TOKEN}
+
+      # OpenRouter API Configuration
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-arcee-ai/trinity-large-preview:free}
+
+      # Whisper Configuration
+      - WHISPER_MODEL=${WHISPER_MODEL:-turbo}
+
+      # Python Configuration
+      - PYTHONUNBUFFERED=1
+
+    volumes:
+      # Persist database
+      - ./data:/app/data
+      # Optional: mount local config for development
+      # - ./.env:/app/.env:ro
+
+      # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Resource limits (optional but recommended)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+    # Health check
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import os; exit(0 if os.path.exists('data/finance.db') else 1)" ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    # Network mode
+    network_mode: bridge
