@@ -12,8 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better layer caching
-COPY requirements/production.txt requirements/
-COPY requirements/base.txt requirements/
+COPY requirements requirements/
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --user -r requirements/production.txt
