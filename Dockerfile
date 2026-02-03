@@ -1,57 +1,37 @@
-# Multi-stage build for optimized image size
+# --- Builder stage (только если нужны C-зависимости) ---
 FROM python:3.9-slim as builder
-
-# Set working directory
 WORKDIR /app
 
-# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
-    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better layer caching
 COPY requirements requirements/
+RUN pip install --no-cache-dir -r requirements/production.txt
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --user -r requirements/production.txt
-
-
-# Final stage - minimal runtime image
+# --- Final stage ---
 FROM python:3.9-slim
+WORKDIR /app
 
-# Install runtime dependencies only
+# Устанавливаем только runtime зависимости
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for security
+# Создаем не-root пользователя
 RUN useradd -m -u 1000 botuser && \
     mkdir -p /app/data && \
     chown -R botuser:botuser /app
 
-# Set working directory
-WORKDIR /app
-
-# Copy Python dependencies from builder
-COPY --from=builder /root/.local /home/botuser/.local
-
-# Copy application code
+# Копируем зависимости и код
+COPY --from=builder /usr/local/lib/python3.9/site-packages /usr/local/lib/python3.9/site-packages
 COPY --chown=botuser:botuser . .
 
-# Switch to non-root user
 USER botuser
-
-# Add local binaries to PATH
-ENV PATH=/home/botuser/.local/bin:$PATH
-
-# Set Python to run in unbuffered mode for better logging
 ENV PYTHONUNBUFFERED=1
 
-# Health check
 HEALTHCHECK --interval=60s --timeout=10s --start-period=40s --retries=3 \
     CMD python -c "import os; exit(0 if os.path.exists('data/finance.db') else 1)"
 
-# Run the bot
 CMD ["python", "bot.py"]
