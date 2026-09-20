@@ -1,0 +1,701 @@
+openapi: 3.0.3
+info:
+  title: Finance Mini App API
+  version: 1.0.0
+  description: |
+    Contract for the Telegram Mini App backend (task T2 of docs/MINIAPP_PLAN.md).
+
+    Conventions
+    - Auth: every endpoint except `/health` requires `Authorization: tma <initData>`,
+      where `initData` is the raw `window.Telegram.WebApp.initData` string. The user is
+      derived from the signed payload; ids are never accepted from the client.
+    - Money: `amount` is a decimal **string** (`"12500.00"`, NUMERIC(14,2) in PostgreSQL),
+      never a float. Allowed range 0.01 to 10,000,000.
+    - Timestamps: ISO 8601 with offset (UTC on the wire). Report ranges use plain dates
+      (`YYYY-MM-DD`, inclusive) interpreted in the user's `timezone`.
+    - Errors: every non-2xx response is `Error` with a stable machine `code`.
+      The client maps `code` to localised text; `message` is English for logs only.
+    - Pagination: keyset. `limit` (default 50, max 100) and opaque `cursor` from the
+      previous page's `next_cursor`.
+servers:
+  - url: /api/v1
+tags:
+  - name: system
+  - name: me
+  - name: categories
+  - name: transactions
+  - name: ai
+  - name: reports
+
+security:
+  - tmaAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: Liveness and DB check (used by Docker healthcheck)
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+        "503":
+          description: Database unreachable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /me:
+    get:
+      tags: [me]
+      summary: Current user (created on first call)
+      operationId: getMe
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /categories:
+    get:
+      tags: [categories]
+      summary: List categories
+      operationId: listCategories
+      parameters:
+        - name: type
+          in: query
+          schema: { $ref: "#/components/schemas/TransactionType" }
+        - name: include_archived
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Category" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [categories]
+      summary: Create category
+      operationId: createCategory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CategoryCreate" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Category" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: Same name and type already exists (`category_exists`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /categories/{categoryId}:
+    parameters:
+      - { $ref: "#/components/parameters/CategoryId" }
+    patch:
+      tags: [categories]
+      summary: Rename or restyle a category (type is immutable)
+      operationId: updateCategory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CategoryUpdate" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Category" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: New name collides with another category (`category_exists`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [categories]
+      summary: Delete a category
+      description: |
+        Fails with 409 `category_in_use` if any transaction references it
+        (DB constraint is ON DELETE RESTRICT). Clients may offer to archive instead
+        via `PATCH {is_archived: true}`.
+      operationId: deleteCategory
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Category has transactions (`category_in_use`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /transactions:
+    get:
+      tags: [transactions]
+      summary: List transactions, newest first
+      operationId: listTransactions
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+        - name: type
+          in: query
+          schema: { $ref: "#/components/schemas/TransactionType" }
+        - name: category_id
+          in: query
+          schema: { type: integer, format: int64 }
+        - name: q
+          in: query
+          description: Case-insensitive substring match on description
+          schema: { type: string, maxLength: 100 }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TransactionPage" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    post:
+      tags: [transactions]
+      summary: Create a transaction
+      description: |
+        Applies the same rules as the legacy bot: amount range, category must belong
+        to the user and match `type`, and duplicate protection (same user, amount,
+        category and note within 60 s returns 409 `duplicate_transaction`).
+        Send `Idempotency-Key` to make retries safe.
+      operationId: createTransaction
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, maxLength: 64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TransactionCreate" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: Category not found (`not_found`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Duplicate within the window (`duplicate_transaction`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /transactions/{transactionId}:
+    parameters:
+      - { $ref: "#/components/parameters/TransactionId" }
+    get:
+      tags: [transactions]
+      summary: Get one transaction
+      operationId: getTransaction
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [transactions]
+      summary: Edit a transaction (new; the bot could only delete)
+      operationId: updateTransaction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TransactionUpdate" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transaction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [transactions]
+      summary: Delete a transaction
+      operationId: deleteTransaction
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /ai/parse:
+    post:
+      tags: [ai]
+      summary: Turn free text into a transaction draft (does not save)
+      description: |
+        Runs the LLM with the user's categories. The result is a draft the UI shows
+        prefilled for confirmation, then saves through `POST /transactions`.
+        `amount` is null when it could not be determined. `category_id` is set when
+        an existing category matched; otherwise `category_name` is a suggestion and
+        `is_new_category` is true (the UI creates it on confirm).
+        Rate limited per user.
+      operationId: parseText
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ParseRequest" }
+      responses:
+        "200":
+          description: Draft
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TransactionDraft" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502":
+          description: LLM failed or returned unusable output (`ai_unavailable`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /ai/transcribe:
+    post:
+      tags: [ai]
+      summary: Speech to text
+      description: |
+        Accepts webm/opus, ogg, mp4/aac or m4a up to 10 MB and 60 s. Server converts
+        with ffmpeg and runs Whisper off the event loop; temp files are always removed.
+        Rate limited per user.
+      operationId: transcribeAudio
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                language:
+                  type: string
+                  description: Optional hint, e.g. `ru`, `uz`
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Transcription" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413":
+          description: File too large or too long (`audio_too_large`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "415":
+          description: Unsupported format (`unsupported_audio`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: No speech recognised (`no_speech`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /reports/summary:
+    get:
+      tags: [reports]
+      summary: Totals for a period
+      operationId: getSummary
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Summary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /reports/by-category:
+    get:
+      tags: [reports]
+      summary: Totals per category for a period and type
+      operationId: getByCategory
+      parameters:
+        - { $ref: "#/components/parameters/From" }
+        - { $ref: "#/components/parameters/To" }
+        - name: type
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/TransactionType" }
+      responses:
+        "200":
+          description: Sorted by total descending
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/CategoryTotal" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /reports/monthly:
+    get:
+      tags: [reports]
+      summary: Income and expense per month (for the bar chart)
+      operationId: getMonthly
+      parameters:
+        - name: months
+          in: query
+          description: How many months back, ending with the current one
+          schema: { type: integer, minimum: 1, maximum: 24, default: 6 }
+      responses:
+        "200":
+          description: Oldest first; months without data are included as zeros
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/MonthTotal" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+components:
+  securitySchemes:
+    tmaAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: "`tma <initData>` (Telegram Mini App signed launch payload)"
+
+  parameters:
+    CategoryId:
+      name: categoryId
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    TransactionId:
+      name: transactionId
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+    From:
+      name: from
+      in: query
+      required: true
+      description: Inclusive start date
+      schema: { type: string, format: date }
+    To:
+      name: to
+      in: query
+      required: true
+      description: Inclusive end date; must be >= from, max span 366 days
+      schema: { type: string, format: date }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing/invalid signature or expired initData (`unauthorized`, `init_data_expired`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found or not owned by the caller (`not_found`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: Invalid input (`validation_error`, `amount_out_of_range`)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests (`rate_limited`)
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - unauthorized
+            - init_data_expired
+            - validation_error
+            - amount_out_of_range
+            - not_found
+            - category_exists
+            - category_in_use
+            - duplicate_transaction
+            - rate_limited
+            - ai_unavailable
+            - audio_too_large
+            - unsupported_audio
+            - no_speech
+            - internal_error
+        message: { type: string }
+        details:
+          type: array
+          description: Per-field problems for `validation_error`
+          items:
+            type: object
+            required: [field, issue]
+            properties:
+              field: { type: string }
+              issue: { type: string }
+
+    TransactionType:
+      type: string
+      enum: [income, expense]
+
+    Money:
+      type: string
+      pattern: '^\d{1,12}(\.\d{1,2})?$'
+      example: "12500.00"
+
+    User:
+      type: object
+      required: [id, telegram_id, first_name, currency, timezone, language_code, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        telegram_id: { type: integer, format: int64 }
+        username: { type: string, nullable: true }
+        first_name: { type: string, nullable: true }
+        language_code: { type: string, example: ru }
+        currency: { type: string, example: UZS }
+        timezone: { type: string, example: Asia/Tashkent }
+        created_at: { type: string, format: date-time }
+
+    Category:
+      type: object
+      required: [id, name, type, is_archived, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string, minLength: 1, maxLength: 50 }
+        type: { $ref: "#/components/schemas/TransactionType" }
+        emoji: { type: string, nullable: true, maxLength: 8 }
+        color:
+          type: string
+          nullable: true
+          pattern: '^#[0-9a-fA-F]{6}$'
+        is_archived: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    CategoryCreate:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 50 }
+        type: { $ref: "#/components/schemas/TransactionType" }
+        emoji: { type: string, nullable: true, maxLength: 8 }
+        color:
+          type: string
+          nullable: true
+          pattern: '^#[0-9a-fA-F]{6}$'
+
+    CategoryUpdate:
+      type: object
+      description: Any subset of fields
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 50 }
+        emoji: { type: string, nullable: true, maxLength: 8 }
+        color:
+          type: string
+          nullable: true
+          pattern: '^#[0-9a-fA-F]{6}$'
+        is_archived: { type: boolean }
+
+    Transaction:
+      type: object
+      required: [id, category_id, amount, type, occurred_at, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        category_id: { type: integer, format: int64 }
+        category: { $ref: "#/components/schemas/Category" }
+        amount: { $ref: "#/components/schemas/Money" }
+        type: { $ref: "#/components/schemas/TransactionType" }
+        description: { type: string, nullable: true, maxLength: 500 }
+        raw_text:
+          type: string
+          nullable: true
+          description: Original AI input if the transaction came from `/ai/parse`
+        occurred_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    TransactionCreate:
+      type: object
+      required: [category_id, amount, type]
+      properties:
+        category_id: { type: integer, format: int64 }
+        amount: { $ref: "#/components/schemas/Money" }
+        type: { $ref: "#/components/schemas/TransactionType" }
+        description: { type: string, nullable: true, maxLength: 500 }
+        raw_text: { type: string, nullable: true, maxLength: 1000 }
+        occurred_at:
+          type: string
+          format: date-time
+          description: Defaults to now
+
+    TransactionUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        category_id: { type: integer, format: int64 }
+        amount: { $ref: "#/components/schemas/Money" }
+        type: { $ref: "#/components/schemas/TransactionType" }
+        description: { type: string, nullable: true, maxLength: 500 }
+        occurred_at: { type: string, format: date-time }
+
+    TransactionPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Transaction" }
+        next_cursor:
+          type: string
+          nullable: true
+          description: Null on the last page
+
+    ParseRequest:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string, minLength: 1, maxLength: 1000 }
+        type_hint:
+          $ref: "#/components/schemas/TransactionType"
+        now:
+          type: string
+          format: date-time
+          description: Client clock, so phrases like "yesterday" resolve correctly
+
+    TransactionDraft:
+      type: object
+      required: [type, is_new_category, raw_text]
+      properties:
+        type: { $ref: "#/components/schemas/TransactionType" }
+        amount:
+          type: string
+          nullable: true
+          pattern: '^\d{1,12}(\.\d{1,2})?$'
+          description: Same format as Money; null if undetermined
+        category_id:
+          type: integer
+          format: int64
+          nullable: true
+        category_name: { type: string, nullable: true }
+        is_new_category: { type: boolean }
+        description: { type: string, nullable: true }
+        occurred_at:
+          type: string
+          format: date-time
+          nullable: true
+        raw_text: { type: string }
+
+    Transcription:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string }
+        language: { type: string, nullable: true }
+
+    Summary:
+      type: object
+      required: [from, to, income, expense, balance, count]
+      properties:
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        income: { $ref: "#/components/schemas/Money" }
+        expense: { $ref: "#/components/schemas/Money" }
+        balance:
+          type: string
+          description: income minus expense, may be negative
+          example: "-1500.00"
+        count: { type: integer }
+
+    CategoryTotal:
+      type: object
+      required: [category_id, name, total, share, count]
+      properties:
+        category_id: { type: integer, format: int64 }
+        name: { type: string }
+        emoji: { type: string, nullable: true }
+        color: { type: string, nullable: true }
+        total: { $ref: "#/components/schemas/Money" }
+        share:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Fraction of the period total for this type
+        count: { type: integer }
+
+    MonthTotal:
+      type: object
+      required: [month, income, expense]
+      properties:
+        month:
+          type: string
+          pattern: '^\d{4}-\d{2}$'
+          example: "2026-09"
+        income: { $ref: "#/components/schemas/Money" }
+        expense: { $ref: "#/components/schemas/Money" }
